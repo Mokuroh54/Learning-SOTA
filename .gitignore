@@ -1,0 +1,6 @@
+# I'm running this on Stanford's Farmshare and using their slurm cluster
+*.log
+*.sh
+
+models
+__pycache__
