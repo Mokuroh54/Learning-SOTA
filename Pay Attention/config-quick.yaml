@@ -1,0 +1,24 @@
+methods: [mha, mqa, gqa, mla]
+
+# Shared
+n_layer: 4
+embd_dims: 256
+block_size: 256
+batch_size: 32
+num_steps: 5000
+lr: 3.0e-4
+
+# MHA/MQA
+n_head: 8
+
+# GQA/MLA
+n_qhead: 8
+n_kvhead: 2
+
+# MLA only
+latent_dims: 128
+rope_dims: 32
+
+# Inference
+infer_batch: 64
+max_new_tokens: 255
