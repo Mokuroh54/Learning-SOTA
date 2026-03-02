@@ -9,7 +9,7 @@ TODO list:
 * Some RL topics
 * Dense Pose?!
 * MoE
-\end{itemize}
 
+01/03/26: More efficient Attention Mechanisms (DSA)
 
 28/02/26: More efficient Attention Mechanisms (MQA, GQA, MLA)

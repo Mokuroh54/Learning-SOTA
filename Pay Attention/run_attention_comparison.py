@@ -1,5 +1,5 @@
 """
-Runner script for comparing attention variants (MHA, MQA, GQA, MLA).
+Runner script for comparing attention variants (MHA, MQA, GQA, MLA, DSA).
 Trains each selected variant, then plots a 2x2 comparison:
   loss curves | KV cache memory
   param count | inference time
@@ -12,7 +12,7 @@ Usage:
   CUDA_VISIBLE_DEVICES=0 python run_attention_comparison.py --methods mha &
   CUDA_VISIBLE_DEVICES=1 python run_attention_comparison.py --methods mqa &
   CUDA_VISIBLE_DEVICES=2 python run_attention_comparison.py --methods gqa &
-  CUDA_VISIBLE_DEVICES=3 python run_attention_comparison.py --methods mla &
+  CUDA_VISIBLE_DEVICES=3 python run_attention_comparison.py --methods mla dsa &
   wait
   python run_attention_comparison.py --plot_only
 """
@@ -43,10 +43,11 @@ MODULE_FILES = {
     'mqa': 'microgpt-mqa.py',
     'gqa': 'microgpt-gqa.py',
     'mla': 'microgpt-mla.py',
+    'dsa': 'microgpt-dsa.py',
 }
 
-LABELS = {'mha': 'MHA', 'mqa': 'MQA', 'gqa': 'GQA', 'mla': 'MLA'}
-COLORS = {'mha': '#1f77b4', 'mqa': '#ff7f0e', 'gqa': '#2ca02c', 'mla': '#d62728'}
+LABELS = {'mha': 'MHA', 'mqa': 'MQA', 'gqa': 'GQA', 'mla': 'MLA', 'dsa': 'DSA'}
+COLORS = {'mha': '#1f77b4', 'mqa': '#ff7f0e', 'gqa': '#2ca02c', 'mla': '#d62728', 'dsa': '#9467bd'}
 
 
 # --- Helpers ---
@@ -70,6 +71,12 @@ def build_model(method, module, args, vocab_size):
         return module.GPT(vocab_size, args.embd_dims, args.n_head,
                           args.latent_dims, args.rope_dims,
                           args.n_layer, args.block_size)
+    elif method == 'dsa':
+        return module.GPT(vocab_size, args.embd_dims, args.n_head,
+                          args.latent_dims, args.rope_dims,
+                          args.n_layer, args.block_size,
+                          getattr(args, 'top_k', 64),
+                          getattr(args, 'warmup_steps', 0))
 
 
 def compute_kv_cache_bytes(method, args):
@@ -85,13 +92,24 @@ def compute_kv_cache_bytes(method, args):
     elif method == 'gqa':
         hd = args.embd_dims // args.n_qhead
         return 2 * L * B * args.n_kvhead * T * hd * 4
-    elif method == 'mla':
+    elif method in ('mla', 'dsa'):
         return L * B * T * (args.latent_dims + args.rope_dims) * 4
 
 
 def train_model(model, train_loader, val_loader, vocab_size, args, device, label):
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_steps)
+    warmup_steps = getattr(model, 'warmup_steps', 0)
+    has_warmup = warmup_steps > 0
+
+    if has_warmup:
+        indexer_params = [p for block in model.blocks for p in block.lindexer.parameters()]
+        main_params = [p for n, p in model.named_parameters() if 'lindexer' not in n]
+        warmup_opt = torch.optim.Adam(indexer_params, lr=1e-3, betas=(0.9, 0.999))
+        main_opt = torch.optim.Adam(main_params, lr=args.lr, betas=(0.9, 0.999))
+        main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            main_opt, T_max=args.num_steps - warmup_steps)
+    else:
+        main_opt = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
+        main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(main_opt, T_max=args.num_steps)
 
     loss_history = []
     train_iter = iter(train_loader)
@@ -106,22 +124,32 @@ def train_model(model, train_loader, val_loader, vocab_size, args, device, label
             x, y = next(train_iter)
 
         x, y = x.to(device), y.to(device)
-        logits = model(x)
-        loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        out = model(x)
+        if isinstance(out, tuple):
+            logits, aux_loss = out
+        else:
+            logits, aux_loss = out, 0.0
+        loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1)) + aux_loss
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
+        if has_warmup and step < warmup_steps:
+            warmup_opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(indexer_params, 1.0)
+            warmup_opt.step()
+        else:
+            main_opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            main_opt.step()
+            main_sched.step()
 
         if (step + 1) % 100 == 0 or step == 0:
             loss_history.append(loss.item())
             elapsed = time.time() - t0
             tps = (step + 1) * args.batch_size * args.block_size / elapsed
-            lr_now = scheduler.get_last_lr()[0]
-            print(f"  [{label}] step {step+1:5d}/{args.num_steps} | "
-                  f"loss {loss.item():.4f} | {tps:,.0f} tok/s | lr {lr_now:.2e}")
+            phase = 'warmup' if has_warmup and step < warmup_steps else 'train'
+            print(f"  [{label}] step {step+1:5d}/{args.num_steps} ({phase}) | "
+                  f"loss {loss.item():.4f} | {tps:,.0f} tok/s")
 
     # Validation
     model.eval()
@@ -129,7 +157,8 @@ def train_model(model, train_loader, val_loader, vocab_size, args, device, label
     with torch.no_grad():
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
-            logits = model(x)
+            out = model(x)
+            logits = out[0] if isinstance(out, tuple) else out
             loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
             val_losses.append(loss.item())
             if len(val_losses) >= 50:
@@ -163,7 +192,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Compare attention variants')
     parser.add_argument('--config', type=str, default=os.path.join(SCRIPT_DIR, 'config.yaml'),
                         help='Path to YAML config file')
-    parser.add_argument('--methods', nargs='+', choices=['mha', 'mqa', 'gqa', 'mla'],
+    parser.add_argument('--methods', nargs='+', choices=['mha', 'mqa', 'gqa', 'mla', 'dsa'],
                         help='Override methods from config')
     parser.add_argument('--save_dir', type=str, default=None,
                         help='Directory for saved results (default: script dir)')
@@ -228,7 +257,7 @@ if __name__ == '__main__':
             model.eval()
             start = torch.tensor([[enc.encode('\n')[0]]] * args.infer_batch, device=device)
             n_runs = 5
-            # Warmup
+            # GPU warmup run (not timed)
             with torch.no_grad():
                 model.generate(start, max_new_tokens=args.max_new_tokens, temperature=0.8)
             if device.type == 'cuda':

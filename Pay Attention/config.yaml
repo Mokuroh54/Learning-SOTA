@@ -11,13 +11,15 @@ lr: 3.0e-4
 # MHA/MQA
 n_head: 8
 
-# GQA
+# GQA/MLA
 n_qhead: 8
 n_kvhead: 2
 
-# MLA only
+# MLA / DSA
 latent_dims: 256
 rope_dims: 64
+top_k: 64
+warmup_steps: 2000
 
 # Inference
 infer_batch: 64

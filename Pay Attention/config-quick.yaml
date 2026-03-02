@@ -1,4 +1,4 @@
-methods: [mha, mqa, gqa, mla]
+methods: [mha, mqa, gqa, mla, dsa]
 
 # Shared
 n_layer: 4
@@ -15,9 +15,11 @@ n_head: 8
 n_qhead: 8
 n_kvhead: 2
 
-# MLA only
+# MLA / DSA
 latent_dims: 128
 rope_dims: 32
+top_k: 32
+warmup_steps: 500
 
 # Inference
 infer_batch: 64

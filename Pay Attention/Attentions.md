@@ -1,6 +1,6 @@
 # More Efficient Attention Mechanisms
 
-Largely based off this godsend of a video: <https://www.youtube.com/watch?v=Y-o545eYjXM>. The author Jiabin Huang makes some really amazing videos, and I have watched basically all of his videos from the past year for my learnings. Therefore, the structure will be very similar to the video, so it's basically a TLDR with some extra explanation on maybe implementation details that the video didn't get into or concepts that took me a bit longer to get.
+Largely based off this godsend of a video: <https://www.youtube.com/watch?v=Y-o545eYjXM>. The creator Jiabin Huang makes some really amazing videos, and I have watched basically all of his videos from the past year for my learnings. Therefore, the structure will be very similar to the video, so it's basically a TLDR with some extra explanation on maybe implementation details that the video didn't get into or concepts that took me a bit longer to get.
 
 Admittedly, drawing the line between what is attention mechanism A and attention mechanism B is pretty pointless. Instead, I want to mostly portray the innovations that get attention to where it is.
 
@@ -9,10 +9,10 @@ Admittedly, drawing the line between what is attention mechanism A and attention
 In traditional attention, each token is associated with a query, key, and value vector. When processing token $t$, we compute $q_tK^T_{t-1}$, where $K_{t-1}$ contains the key vectors for each preceding token. We want the model to learn $q$ and $k$ such that these values indicate some sort of "importance score" for each previous token. In loose terms, $q_t$ represents the information the model is looking for, and $k_t$ represents the information that the token can provide. For example, if the model sees tokens "After a long day, my new car is still" and needs to predict a next word, we expect to see a high score for the token "new" but probably lower scores for "day". The attention scores are then multiplied with $V_{t-1}$, which contains the information that the token can give. Concretely, attention is written as:
 
 $$
-\operatorname{softmax}(\frac{QK^T}{\sqrt{d_k}})V
+\text{softmax}(\frac{QK^T}{\sqrt{d_k}})V
 $$
 
-where we use softmax to generate a probability distribution among the scores, and we scale by a factor of $\sqrt{d_k}$ because of the curse of dimensionality. The query, key, and value vectors are learned functions of the token embedding (i.e. $Q=XW_q,K=XW_k,V=XW_v$). Finally, the output is projected back into the embedding space.
+where we use softmax to generate a probability distribution among the scores, and we scale by a factor of $\sqrt{d_k}$ to avoid vanishing gradients. The query, key, and value vectors are learned functions of the token embedding (i.e. $Q=XW_q,K=XW_k,V=XW_v$). Finally, the output is projected back into the embedding space.
 
 ## Multihead Attention (2017)
 
@@ -46,16 +46,40 @@ Observe that because the keys and values are both projected into this low rank, 
 
 But we can take this idea even further at inference time. Let's revisit our attention function all the way back.
 
-$\operatorname{softmax} (\frac{XQ_dQ_u^{(i)}{K_u^{(i)}}^TC_{kv}^T}{d_k})C_{kv}V_u^{(i)}$
+$\text{softmax} (\frac{XQ_dQ_u^{(i)}{K_u^{(i)}}^TC_{kv}^T}{\sqrt{d_k}})C_{kv}V_u^{(i)}$
 
 And this is just for a single head!
 
-As $Q_dQ_uK_u^T$ is fixed, we can condense that into a single matrix. Note also that at the end of our calculation, we must right multiply our result by $W_o$, meaning we can also combine $V_uW_o$ together as well. All of these optimizations ensure that MLA can run much faster than any previous attention mechanism with similar performance to MHA.
+As $Q_uK_u^T$ is fixed, we can condense that into a single matrix. Note also that at the end of our calculation, we must right multiply our result by $W_o$, meaning we can also combine $V_uW_o$ together as well. All of these optimizations ensure that MLA can run much faster than any previous attention mechanism with similar performance to MHA.
 
 ### Rotary Positional Embedding
 
-Traditional transformers use a sinusoidal positional embedding, which have several problems, but most of them center on the inherent fixedness of such a representation. It is difficult to generalize sinusoidal positional embeddings for high sequence lengths, and the embeddings are fixed on absolute indices of tokens, so patterns are hard to detect. Instead, researchers thought to use rotations around the origin as positional embeddings. This fixes the absolute nature of sinusoidal positional embeddings, and has largely replaced it in modern transformers. In practice, the input sequence is split into two halves, and corresponding indices are paired to be rotated.
+Traditional transformers use a sinusoidal positional embedding, which have several problems, but most of them center on the inherent fixedness of such a representation. It is difficult to generalize sinusoidal positional embeddings for high sequence lengths, and the embeddings are fixed on absolute indices of tokens, so patterns are hard to detect. Instead, researchers thought to use rotations around the origin as positional embeddings. This fixes the absolute nature of sinusoidal positional embeddings, and has largely replaced it in modern transformers. In practice, the embedding dimensions are split into two halves, and corresponding indices are paired to be rotated.
 
 As good as MLA is, trying to use ROPE with MLA is difficult. Since the rotations depends on the exact query position, this prevents us from absorbing $Q_dQ_u^{(i)}K_u^{(i)}$, because we instead need to compute $Q_dQ_u^{(i)}R_qR_kK_u^{(i)}$. Since $R_q$ and $R_k$ change from token to token, preocmputing this is impossible. Instead, researchers decided to split the positional information from the content. In particular, we allocate $d_r$ dimensions to store the positional information of the queries and keys. 
 
 The implmentation was a bit hard for me to grasp at first, particularly due to the asymmetry between how queries and keys are handled. But I think a good way to make this intuitive is to remember why attention still evolved after MHA: reducing KV cache. For the queries, we are free to generate one ROPE matrix per head, but since we want our KV cache to be as small as possible, and we only need one of ROPE matrix for the keys, that is our choice. This also explains why we generate the query ROPE matrix from the latent queries but the key ROPE matrix from our original tokens: our queries need to learn positional information per head, but because the keys are fixed, we can just use one representation. This method is called decoupled ROPE.
+
+## Deepseek Sparse Attention (2025)
+
+Sidenote: I wonder if there's some analogue to Moore's Law for context lengths.
+
+Anyways the impetus behind DSA is that for very long sequences, we might attend to many tokens that might be irrelevant. For example, I have chats on Gemini where I ask questions about multiple topics in the same conversation, and it tries really hard to connect my current talking points with something we said 5 days ago, which is really not what I'm looking for. 
+
+Instead of attending over all tokens, DSA proposes a lightning indexer that can generate a rough list of $k$ tokens that might be relevant, before the full attention is run on those $k$ tokens. The lightning indexer works similarly to attention, with some differences. Instead of using softmax, the indexer uses ReLU to zero out negative scores that don't provide useful information in the first place. Additionally, each head has a learnable weight that adjusts how much contribution they provide for every query. The weighted sum is computed to produce the final scores, and the top $k$ tokens are selected.
+
+The obvious question here is "if lightning indexing is similar to attention, how does this actually help"? The key lies in the role of the indexer: a *coarse* approximation. This means we can cut some corners and tolerate a lower accuracy. First, like MQA, we can just create one set of key vectors instead of one for each head. Remember that the performance loss is acceptable here. More importantly, instead of using full precision, we can instead clamp our values down to fp8 precision, providing a 2x/4x speedup over fp16/fp32. This means that the full attention can run in $O(Tk)$ time, where $T$ is the sequence length, and while the lightning indexer still takes $O(T^2)$ time, the constant factor is improved. 
+
+There is a potential issue though. We usually normalize the vector by dividing each value in the vector by the max, but if there some neurons that are significantly larger than others, clamping them to fp8 might cause them to "lose signal." For example, if they are off by a magnitude of 1000x, then the lower value will become $0$. To "smooth out" the vector, we apply the Fast Walsh-Hadamard Transform, which is a very optimized function on modern GPUs. That said, I think the use of the FWHT here is up for debate. I was also suggested to normalize the query and key vectors by the sqrt of their respective dimensions before feeding into the FWHT. It seems to make sense, but it's not in the paper and I don't know if it's the right choice.
+
+To train this lightning indexer, we first allocate some number of warmup steps that allows the indexer to become a good approximator of the full attention. In particular, the loss becomes the KL divergence of the two distributions.
+
+## Remarks
+
+I don't think it's up for debate that attention is the most significant advancement to ML ever, and it's quite interesting to see how far it's come since its original proposition over a decade ago. It seems that the early research in improving attention was pioneered by Google (MHA, MQA, GQA), but lately Deepseek has been spending a lot of effort into optimizing Attention here. From what I know, compute is much harder to come by in China, which could be why the researchers working on Gemini haven't found a need for it yet. That said, the improvements become better as the models grow larger, so I'm interested in seeing what impact something like DSA would have on Gemini.
+
+I had Claude Code write me a comparison script, but frankly the scale is nowhere large enough to effectively see the true improvements in time/performances each of the attention mechanisms have. DSA chooses the top 2048 tokens to do full attention on, and I will not be training on anything that makes the lightning indexer worth it at that scale. 
+
+This is my first attempt at this, and frankly I'm still trying to figure out how to most effectively use Claude Code as a teacher and how much I should let it implement. I will say for sure I would not be doing this if Claude Code couldn't write a lot of the skeleton code for me. I do think that even though AI development is moving away from hand-writing code, writing out the key parts of the attention mechanisms by hand has taught me more (and made the concepts stick much easier) than just watching the video or reading papers/blogs. 
+
+I don't know how to end this and I also don't know if people/who will read this. Hopefully they do. Thanks for reading, if anyone sees this :>

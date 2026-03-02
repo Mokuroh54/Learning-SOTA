@@ -183,21 +183,20 @@ class GPT(nn.Module):
         #   sum_h (attn_h @ ckv @ Wvup_h^T) @ Wo_h^T
         #       = sum_h attn_h @ ckv @ (Wvup_h^T @ Wo_h^T)
         #       = sum_h attn_h @ ckv @ W_vo_h
-        wqupkups = []
-        wvupos = []
+        absorbed_qk = []
+        absorbed_vo = []
         for block in self.blocks:
             a = block.attn
             hd = a.head_dim
             H = a.n_head
 
-            wqup = a.wqup.weight.view(H, hd, -1)
-            wkup = a.wkup.weight.view(H, hd, -1)
-            wqupkups.append(wqup.transpose(-1, -2) @ wkup)
+            wqup = a.wqup.weight.view(H, hd, -1)             # (H, hd, latent)
+            wkup = a.wkup.weight.view(H, hd, -1)             # (H, hd, latent)
+            absorbed_qk.append(wqup.transpose(-1, -2) @ wkup) # (H, latent, latent)
 
-            wvup = a.wvup.weight.view(H, hd, -1)
-            wo = a.wo.weight.T.contiguous().view(H, hd, -1)
-            wvupos.append(wvup.transpose(-1, -2) @ wo)
-            
+            wvup = a.wvup.weight.view(H, hd, -1)             # (H, hd, latent)
+            wo = a.wo.weight.T.contiguous().view(H, hd, -1)  # (H, hd, embd)
+            absorbed_vo.append(wvup.transpose(-1, -2) @ wo)   # (H, latent, embd)
         # ── 2. Prefill: run prompt tokens, build ckv cache ──
         kv_cache = []  # per layer: (B, T, latent_dims)
         kr_cache = []
@@ -212,24 +211,24 @@ class GPT(nn.Module):
             H = a.n_head
             nx = block.norm1(x)
 
-            q  = a.wqdown(nx)                                                                    # (B, T, latent_dims)
-            qr = apply_rotary_emb(a.wqr(q).view(B, T, H, rd).transpose(1, 2), a.rope_cos, a.rope_sin)  # (B, H, T, rd)
-            ckv = a.wkvdown(nx)                                                                  # (B, T, latent_dims)
+            ql = a.wqdown(nx)                                                                    # (B, T, latent)
+            qr = apply_rotary_emb(a.wqr(ql).view(B, T, H, rd).transpose(1, 2), a.rope_cos, a.rope_sin)  # (B, H, T, rd)
+            ckv = a.wkvdown(nx)                                                                  # (B, T, latent)
             kr = apply_rotary_emb(a.wkr(nx).unsqueeze(1), a.rope_cos, a.rope_sin)               # (B, 1, T, rd)
 
             kv_cache.append(ckv)
             kr_cache.append(kr)
 
-            wqupkup = wqupkups[i]
-            wvupo = wvupos[i]
+            W_qk = absorbed_qk[i]
+            W_vo = absorbed_vo[i]
 
-            # scores = ql @ W_qk_h @ ckv^T + qr @ kr^T  → (B, H, T, T)
-            content_scores = q.unsqueeze(1) @ wqupkup @ ckv.unsqueeze(1).transpose(-1, -2)
+            # scores = ql @ W_qk @ ckv^T + qr @ kr^T  → (B, H, T, T)
+            content_scores = ql.unsqueeze(1) @ W_qk @ ckv.unsqueeze(1).transpose(-1, -2)
             rope_scores = qr @ kr.transpose(-1, -2)
             scores = (content_scores + rope_scores) / math.sqrt(hd + rd)
             scores = scores.masked_fill(a.mask[:T, :T], float('-inf'))
             attn = F.softmax(scores, dim=-1)
-            out = (attn @ ckv.unsqueeze(1) @ wvupo).sum(dim=1)
+            out = (attn @ ckv.unsqueeze(1) @ W_vo).sum(dim=1)
 
             x = x + out
             x = x + block.mlp(block.norm2(x))
@@ -249,25 +248,25 @@ class GPT(nn.Module):
                 cos_pos = a.rope_cos[pos:pos+1]
                 sin_pos = a.rope_sin[pos:pos+1]
 
-                q = a.wqdown(nx)                                                           # (B, 1, latent_dims)
-                qr = apply_rotary_emb(a.wqr(q).view(B, 1, H, rd).transpose(1, 2), cos_pos, sin_pos)  # (B, H, 1, rd)
+                ql = a.wqdown(nx)                                                          # (B, 1, latent)
+                qr = apply_rotary_emb(a.wqr(ql).view(B, 1, H, rd).transpose(1, 2), cos_pos, sin_pos)  # (B, H, 1, rd)
 
-                ckv = a.wkvdown(nx)                                                        # (B, 1, latent_dims)
+                ckv = a.wkvdown(nx)                                                        # (B, 1, latent)
                 kv_cache[i] = torch.cat([kv_cache[i], ckv], dim=1)
-                ckv_all = kv_cache[i]                                                      # (B, T_cur, latent_dims)
+                ckv_all = kv_cache[i]                                                      # (B, T_cur, latent)
                 kr = apply_rotary_emb(a.wkr(nx).unsqueeze(1), cos_pos, sin_pos)            # (B, 1, 1, rd)
                 kr_cache[i] = torch.cat([kr_cache[i], kr], dim=2)
                 kr_all = kr_cache[i]
 
-                wqupkup = wqupkups[i]
-                wvupo = wvupos[i]
+                W_qk = absorbed_qk[i]
+                W_vo = absorbed_vo[i]
 
                 # scores → (B, H, 1, T_cur), no causal mask needed (single new token)
-                content_scores = q.unsqueeze(1) @ wqupkup @ ckv_all.unsqueeze(1).transpose(-1, -2)
+                content_scores = ql.unsqueeze(1) @ W_qk @ ckv_all.unsqueeze(1).transpose(-1, -2)
                 rope_scores = qr @ kr_all.transpose(-1, -2)
                 scores = (content_scores + rope_scores) / math.sqrt(hd + rd)
                 attn = F.softmax(scores, dim=-1)
-                out = (attn @ ckv_all.unsqueeze(1) @ wvupo).sum(dim=1)
+                out = (attn @ ckv_all.unsqueeze(1) @ W_vo).sum(dim=1)
 
                 x_new = x_new + out
                 x_new = x_new + block.mlp(block.norm2(x_new))
