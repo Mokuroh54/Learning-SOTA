@@ -1,4 +1,4 @@
-# More Efficient Attention Mechanisms
+# More Efficient Softmax Attention Mechanisms
 
 Largely based off this godsend of a video: <https://www.youtube.com/watch?v=Y-o545eYjXM>. The creator Jiabin Huang makes some really amazing videos, and I have watched basically all of his videos from the past year for my learnings. Therefore, the structure will be very similar to the video, so it's basically a TLDR with some extra explanation on maybe implementation details that the video didn't get into or concepts that took me a bit longer to get.
 

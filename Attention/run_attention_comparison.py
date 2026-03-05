@@ -5,23 +5,23 @@ Trains each selected variant, then plots a 2x2 comparison:
   param count | inference time
 
 Usage:
-  # Sequential (all on one GPU):
+  # Parallel (one method per GPU, automatic):
   python run_attention_comparison.py
 
-  # Parallel (one method per GPU, then combine):
-  CUDA_VISIBLE_DEVICES=0 python run_attention_comparison.py --methods mha &
-  CUDA_VISIBLE_DEVICES=1 python run_attention_comparison.py --methods mqa &
-  CUDA_VISIBLE_DEVICES=2 python run_attention_comparison.py --methods gqa &
-  CUDA_VISIBLE_DEVICES=3 python run_attention_comparison.py --methods mla dsa &
-  wait
+  # Sequential (force single GPU):
+  python run_attention_comparison.py --sequential
+
+  # Plot only (load saved results):
   python run_attention_comparison.py --plot_only
 """
 
 import os
+import sys
 import math
 import time
 import argparse
 import importlib.util
+import subprocess
 import yaml
 
 import tiktoken
@@ -198,6 +198,10 @@ if __name__ == '__main__':
                         help='Directory for saved results (default: script dir)')
     parser.add_argument('--plot_only', action='store_true',
                         help='Skip training, load saved results and plot')
+    parser.add_argument('--sequential', action='store_true',
+                        help='Train sequentially on one GPU instead of parallel')
+    parser.add_argument('--_worker', type=str, default=None,
+                        help=argparse.SUPPRESS)  # internal: single-method worker mode
     cli_args = parser.parse_args()
 
     # Load config from YAML, then apply CLI overrides
@@ -212,13 +216,14 @@ if __name__ == '__main__':
     save_dir = args.save_dir or SCRIPT_DIR
     os.makedirs(save_dir, exist_ok=True)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def train_single_method(method, device):
+        """Train one method on the given device. Used by both sequential and worker modes."""
+        label = LABELS[method]
+        print(f"\n{'='*60}")
+        print(f"  Training: {label} on {device}")
+        print(f"{'='*60}")
 
-    if not args.plot_only:
-        print(f"device: {device}")
-        print(f"methods: {', '.join(LABELS[m] for m in args.methods)}")
-
-        # Load dataset once
+        # Load dataset
         print("Loading WikiText-103...")
         ds = load_dataset('wikitext', 'wikitext-103-raw-v1')
         enc = tiktoken.get_encoding('gpt2')
@@ -236,67 +241,109 @@ if __name__ == '__main__':
         val_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=args.batch_size, drop_last=True)
 
-        # Train each variant
-        for method in args.methods:
-            label = LABELS[method]
-            print(f"\n{'='*60}")
-            print(f"  Training: {label}")
-            print(f"{'='*60}")
+        module = load_module(method)
+        model = build_model(method, module, args, vocab_size).to(device)
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"  params: {num_params:,}")
 
-            module = load_module(method)
-            model = build_model(method, module, args, vocab_size).to(device)
-            num_params = sum(p.numel() for p in model.parameters())
-            print(f"  params: {num_params:,}")
+        loss_history, val_loss = train_model(
+            model, train_loader, val_loader, vocab_size, args, device, label)
 
-            loss_history, val_loss = train_model(
-                model, train_loader, val_loader, vocab_size, args, device, label)
+        kv_bytes = compute_kv_cache_bytes(method, args)
 
-            kv_bytes = compute_kv_cache_bytes(method, args)
-
-            # Inference timing (average over multiple runs)
-            model.eval()
-            start = torch.tensor([[enc.encode('\n')[0]]] * args.infer_batch, device=device)
-            n_runs = 5
-            # GPU warmup run (not timed)
+        # Inference timing (average over multiple runs)
+        model.eval()
+        start = torch.tensor([[enc.encode('\n')[0]]] * args.infer_batch, device=device)
+        n_runs = 5
+        with torch.no_grad():
+            model.generate(start, max_new_tokens=args.max_new_tokens, temperature=0.8)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        infer_times = []
+        for _ in range(n_runs):
+            t_infer = time.time()
             with torch.no_grad():
                 model.generate(start, max_new_tokens=args.max_new_tokens, temperature=0.8)
             if device.type == 'cuda':
                 torch.cuda.synchronize()
-            infer_times = []
-            for _ in range(n_runs):
-                t_infer = time.time()
-                with torch.no_grad():
-                    model.generate(start, max_new_tokens=args.max_new_tokens, temperature=0.8)
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                infer_times.append(time.time() - t_infer)
-            infer_time = sum(infer_times) / n_runs
+            infer_times.append(time.time() - t_infer)
+        infer_time = sum(infer_times) / n_runs
 
-            result = {
-                'loss_history': loss_history,
-                'val_loss': val_loss,
-                'infer_time': infer_time,
-                'kv_cache_bytes': kv_bytes,
-                'num_params': num_params,
-            }
+        result = {
+            'loss_history': loss_history,
+            'val_loss': val_loss,
+            'infer_time': infer_time,
+            'kv_cache_bytes': kv_bytes,
+            'num_params': num_params,
+        }
 
-            # Save result metrics
-            result_path = os.path.join(save_dir, f'results_{method}.pt')
-            torch.save(result, result_path)
+        result_path = os.path.join(save_dir, f'results_{method}.pt')
+        torch.save(result, result_path)
 
-            # Save model weights
-            model_dir = os.path.join(SCRIPT_DIR, 'models')
-            os.makedirs(model_dir, exist_ok=True)
-            model_path = os.path.join(model_dir, f'{method}.pt')
-            torch.save(model.state_dict(), model_path)
+        model_dir = os.path.join(SCRIPT_DIR, 'models')
+        os.makedirs(model_dir, exist_ok=True)
+        model_path = os.path.join(model_dir, f'{method}.pt')
+        torch.save(model.state_dict(), model_path)
 
-            print(f"  val loss: {val_loss:.4f} (ppl {math.exp(val_loss):.1f})")
-            print(f"  inference: {infer_time:.3f}s (B={args.infer_batch}, T={args.max_new_tokens})")
-            print(f"  KV cache: {kv_bytes / 1024 / 1024:.2f} MB")
-            print(f"  model saved to {model_path}")
+        print(f"  val loss: {val_loss:.4f} (ppl {math.exp(val_loss):.1f})")
+        print(f"  inference: {infer_time:.3f}s (B={args.infer_batch}, T={args.max_new_tokens})")
+        print(f"  KV cache: {kv_bytes / 1024 / 1024:.2f} MB")
+        print(f"  model saved to {model_path}")
 
-            del model, module
+        del model, module
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # --- Worker mode: train a single method and exit ---
+    if cli_args._worker:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        train_single_method(cli_args._worker, device)
+        sys.exit(0)
+
+    if not args.plot_only:
+        n_gpus = torch.cuda.device_count()
+        use_parallel = not cli_args.sequential and n_gpus > 1
+        print(f"GPUs available: {n_gpus}")
+        print(f"methods: {', '.join(LABELS[m] for m in args.methods)}")
+        print(f"mode: {'parallel (%d GPUs)' % n_gpus if use_parallel else 'sequential'}")
+
+        if use_parallel:
+            # Spawn one subprocess per method, each pinned to a different GPU
+            procs = []
+            for i, method in enumerate(args.methods):
+                gpu_id = i % n_gpus
+                env = os.environ.copy()
+                env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+                cmd = [
+                    sys.executable, os.path.abspath(__file__),
+                    '--config', cli_args.config,
+                    '--_worker', method,
+                ]
+                if args.save_dir:
+                    cmd += ['--save_dir', args.save_dir]
+                print(f"  Launching {LABELS[method]} on GPU {gpu_id} (pid pending...)")
+                p = subprocess.Popen(cmd, env=env)
+                procs.append((method, gpu_id, p))
+                print(f"  Launched {LABELS[method]} on GPU {gpu_id} (pid {p.pid})")
+
+            # Wait for all to finish
+            failed = []
+            for method, gpu_id, p in procs:
+                p.wait()
+                if p.returncode != 0:
+                    failed.append(method)
+                    print(f"  ERROR: {LABELS[method]} (GPU {gpu_id}) exited with code {p.returncode}")
+                else:
+                    print(f"  Done: {LABELS[method]} (GPU {gpu_id})")
+
+            if failed:
+                print(f"\nWARNING: These methods failed: {', '.join(LABELS[m] for m in failed)}")
+        else:
+            # Sequential: train one at a time on the default device
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"device: {device}")
+            for method in args.methods:
+                train_single_method(method, device)
 
     # --- Load results and plot ---
     results = {}
