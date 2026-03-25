@@ -11,6 +11,9 @@ TODO list roughly in order of interest:
 * Dense Pose?!
 * Recursive Language Models (?)
 
+23/03/26: Attention Residuals
+I was busy for a while and then I had finals :sob:
+
 04/03/26: More efficient Attention (Linear Attention)
 
 01/03/26: More efficient Attention Mechanisms (DSA)
